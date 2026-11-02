@@ -85,7 +85,7 @@ background_OD_additive <- data %>%
 data <- data %>% 
   filter(well_type != "frame")
 
-data <- left_join(data, background_OD_additive, by= "additive")
+data <- left_join(data, background_OD_additive, by = "additive")
 
 data <- data %>% 
   mutate(OD_wo_background = OD - background_additive)
@@ -101,7 +101,7 @@ background_OD_strain <- data %>%
 data <- left_join(data, background_OD_strain, by= "strain")
 
 
-#this datafram is falmiliar,as this is the one I've been receiving
+#this dataframe is falmiliar,as this is the one I've been receiving
 data <- data %>% 
   mutate(relative_OD = OD_wo_background/untreated_strain)
 
