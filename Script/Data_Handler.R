@@ -502,8 +502,8 @@ outliers_combined <- median_frame |>
                            true = if_else(row_number() %in% Hampel(norm_od, 6), 3, 0), # 3 = Hampel Outlier, 0 = non-outlier
                            false =  if_else(madness == 1, true = 1, false = 2)), .by = identifier)
 
-#visualization of the outlier filtering
 
+#visualization of the outlier filtering
 strain_list <- unique(merged_data$strain)
 plots <- list()
 
@@ -525,7 +525,7 @@ if (generate_images) {
   }
 
   #exporting
-  pdf(file = file.path(save_folder, paste0("outliers_", measurement_date, ".pdf")), width = 7, height = 6)
+  pdf(file = file.path(save_folder, paste0("outliers_", measurement_date, ".pdf")), width = 10)
   for (plot in plots) {
     print(plot)
   }
@@ -570,7 +570,7 @@ additives_filtered_outliers <- additive_means_norms |>
 #performing the testing =========
 #also old code but no way I'm revising this.... unless really needed...
 
-#prparing the data for the test
+#preparing the data for the test
 t_test_data <- additives_filtered_outliers |> 
   group_by(identifier) |> 
   mutate(untreated_od =  #this section filters out the replicates with no control = all controls were outliers
@@ -588,10 +588,40 @@ t_test_data <- additives_filtered_outliers |>
          .by = c("identifier", "additive")) |> 
   distinct(identifier, strain, additive, mean_untreated_od, mean_treated_od, median_untreated_od, median_treated_od)
 
+#prep for the replicate reduction
+#extracting the date and also handling it as a date (might be useful later idk?)
+dated_data <- t_test_data |> 
+  filter(complete.cases(median_untreated_od, median_treated_od)) |> 
+  mutate(date_str = str_extract(string = identifier, pattern = "\\d{6}"),
+         date = as.Date(date_str, format = '%y%m%d'), .before = identifier)
+
+
+#creating the working dataframe
+date_sorted_data <- dated_data |> 
+  group_by(strain, additive) |> 
+  
+  #ordering newest first (remove 'desc()' to see with oldest-first)
+  #identifier is used to handle same-date experiment ties in ordering
+  arrange(desc(date), identifier) |>
+  
+  #counting replicates by group and ordering them based on position in the order
+  mutate(replicates = n(),
+         repli_order = row_number()) |> 
+  
+  #selecting only the pairs that have enough replicates to run all tests
+  #this is to make sure all tests use the same data
+  #replace 3 witha variable to set replicate upper limit, 3 is the standard currently
+  filter(replicates >= 3,
+         repli_order <= 3) |> 
+  ungroup()
+
+View(date_sorted_data |> 
+       group_by(strain, additive) |> 
+       summarise(n = n()))
 
 #paired t-test, can use both means and medians, but the difference is meager 
 #using MEDIANs as of now due to not-insignificant spread in the data
-t_test_results <- t_test_data |> 
+t_test_results <- date_sorted_data |> 
   filter(complete.cases(median_untreated_od, median_treated_od)) |> 
   summarise(paired_p_value =
               if (n() >= 2 && sd(median_untreated_od - median_treated_od) > 0)
@@ -610,10 +640,11 @@ t_test_results_fdr <- t_test_results |>
 #exporting the data  ------------
 #preparing the data for exporting
 #replicate count
-replicate_count <- t_test_data |> 
+replicate_count <- date_sorted_data |> 
   summarise(replicate_nr = n(), .by = c("strain", "additive"))
 
 #tidying
+#replicate count not needed if standardized for 3 replicates
 final_test_results <- t_test_results_fdr |> 
   filter(additive != "empty") |>
   arrange(strain, additive) |> 
@@ -634,8 +665,13 @@ test_result_significance <- final_test_results |>
 write_csv(x = final_test_results, file = file.path(save_folder, paste0("test_results_", measurement_date, ".csv")))
 write_csv(x = test_result_significance, file = file.path(save_folder, paste0("test_significance_", measurement_date, ".csv")))
 
+#exporting with relative OD
+OD_values <- outlier_filtered_frame |> 
+  select(identifier, strain, additive, relative_od) |> 
+  mutate(relative_od = if_else(relative_od < 0, true = 0, false = relative_od)) |> 
+  summarise(relative_od_mean  = mean(relative_od), .by = c("strain", "additive"))
 
-# TO_DO LIST for tomorrow:
-# - update the other 2 code files
-# - update the t-test to only include strain with 3 measurements
-#   and for strains that have more than 3 only use the latest 3
+results_for_plotting <- t_test_results_fdr |> 
+  left_join(OD_values, by = c("strain", "additive"))
+
+write_csv(x = results_for_plotting, file = file.path(save_folder, paste0("realtive_od_results_", measurement_date, ".csv")))

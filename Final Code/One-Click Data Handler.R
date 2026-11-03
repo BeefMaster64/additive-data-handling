@@ -1,9 +1,3 @@
-#changes  both here ad the amrkdown:
-#   renamed first image export name to od_spread_...
-#   outliers_xxxx... now belongs to second image set pdf
-#   new section of merging and filtering and further stuff
-#   t-test, data export, such and such
-
 library(tidyverse)
 library(readxl)
 library(ggplate)
@@ -99,9 +93,8 @@ od_table_wide <- od_with_well_pos |>
                                .default = NA_character_), .after = Additive) |> 
   unite(col = "pos_96", Row, Column, sep = "")
 
-
 #saving this middle od table in case it's needed
-write_csv(x = od_table_wide, file = file.path(save_folder, paste0("plate_", measurement_date, ".csv")))
+#write_csv(x = od_table_wide, file = file.path(save_folder, paste0("plate_", measurement_date, ".csv")))
 
 
 #merge with the script_v2.R code ================ 
@@ -157,9 +150,8 @@ if (generate_images) {
   for (plot in plate_images) {
     print(plot)
   }
-  plate_box
+  print(plate_box)
   dev.off()
-  
 }
 
 #background subtraction and relative OD calculation ===========
@@ -250,3 +242,236 @@ if (generate_images) {
   }
   dev.off()
 }
+
+#combining the results with all the previous data ============
+# importing the previous data title 'merged_data_xxxxxx_yyyyyy'
+# where x's are the oldest data date in the set, an y's are the latest data date
+message("Please select the merged data of All previous measurements\n
+The title should be \'merged_data_xxxxxx-yyyyyy.csv\'\nWhere X and Y are the measurement dates")
+previous_data <- file.choose()
+
+#merging the old and new data, solving naming convention issues
+merged_data <- read_csv(previous_data) |> 
+  bind_rows(clean_data |> 
+              mutate(strain = sub(pattern = "_[0-9]+$", "", strain))) |> 
+  mutate(identifier = identifier |>
+           str_replace("^(id_[0-9]{6}) (.+)_1$", "\\1_A \\2") |>
+           str_replace("^(id_[0-9]{6}) (.+)_2$", "\\1_B \\2"), #god the regex is getting complex...
+         identifier = sub(pattern = "^([0-9]{6})", "id_\\1", identifier))
+
+#exporting the new merged table to be used for future calculations
+#the final name of the newly exported, updated data
+export_name <- previous_data |> 
+  basename() |> 
+  str_remove(pattern = "(?<=-).*$") |> 
+  paste0(measurement_date)
+
+write_csv(x = merged_data, 
+          file = file.path(output_dir, paste0(export_name, ".csv")))
+
+#combined outlier elimination ---------
+#this is pretty dirty code written by me ~a year ago, it works, but needs a revision
+
+#hartigan's dip test of multimodality to remove entire problematic plates
+hartigans_test <- merged_data |>
+  select(!relative_od & !untreated_od) |>
+  filter(additive == "empty") |> 
+  summarise(hartigans_dip_p = dip.test(od_wo_background)$p.value, .by = identifier) |> 
+  mutate(modality = if_else(hartigans_dip_p <= 0.05, 1, 0)) # 1 = multimodal outlier
+
+# calculating stats for the next filter and joining previous filter results
+plate_stats <- merged_data |> 
+  filter(additive == "empty") |> 
+  summarise(
+    med = median(od_wo_background, na.rm = T),
+    med_dev = mad(od_wo_background, na.rm = T),
+    .by = c(strain, identifier)
+  ) |> 
+  left_join(hartigans_test, by = "identifier")
+
+# MAD filter for plates that show an excessive spread of measured values
+MAD_outliers <- plate_stats |> 
+  mutate(madness = if_else(modality == 0,
+                           true = if_else(row_number() %in% Hampel(med_dev, 3, "upper"), true = 2, false = 0),
+                           false = 1), .by = strain) #2 = MAD filter outlier
+
+#joining the outliers and normalizing the od for the next step
+median_frame <- merged_data |> 
+  filter(additive == "empty") |> 
+  left_join(MAD_outliers, by = c("strain", "identifier")) |> 
+  mutate(norm_od = od_wo_background - med) |> 
+  select(strain, identifier, additive, od_wo_background, med, med_dev, norm_od, modality, madness)
+
+
+outliers_combined <- median_frame |> 
+  mutate(outlier = if_else(madness == 0,
+                           true = if_else(row_number() %in% Hampel(norm_od, 6), 3, 0), # 3 = Hampel Outlier, 0 = non-outlier
+                           false =  if_else(madness == 1, true = 1, false = 2)), .by = identifier)
+
+#visualization of the outlier filtering
+if (generate_images) {
+  strain_list <- unique(merged_data$strain)
+  plots <- list()
+  
+  for (i in strain_list) {
+    plots[[i]] <- ggplot(data = outliers_combined |> 
+                           filter(strain == i) |> 
+                           mutate(identifier = sub(" .*", "", identifier)), 
+                         aes(x = identifier, y = od_wo_background)) +
+      geom_point(aes(color = factor(outlier, levels = c(0,1,2,3), labels = c("Non-outlier", "Multimodal", "MAD outlier", "Hampel outlier"))),
+                 position = position_jitter(width = 0.2, height = 0)) +
+      labs(title = paste("Outliers of", i, sep = " "),
+           x = "Identifier",
+           y = "OD",
+           color = "Outliers") +
+      theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+      scale_color_manual(values = c("Non-outlier" = "#00F545", "Multimodal" = "#6B72FF", "MAD outlier" = "#AE6BFF", "Hampel outlier" = "#F86BFF"))
+  }
+  
+  #exporting
+  pdf(file = file.path(save_folder, paste0("outliers_", measurement_date, ".pdf")), width = 10)
+  for (plot in plots) {
+    print(plot)
+  }
+  dev.off()
+}
+
+#removing the outlier plates ==================
+#such a dumb way to do it....
+#but it works..... for now.... old code, needs revision
+
+plates_to_remove <- outliers_combined |> 
+  filter(outlier %in% c(1,2)) |> 
+  distinct(identifier) |> 
+  pull(identifier)
+
+outlier_filtered_frame <- merged_data |> 
+  filter(!identifier %in% plates_to_remove)
+
+
+#filtering out outlier measurements
+#applying the Hampel filter to treatments as well
+non_outlier_plates <- outliers_combined |> 
+  filter(outlier == 0) |> 
+  select(!med_dev & !modality & !madness) |> 
+  mutate(outlier = 2) |>  #2 = control values in current scope
+  relocate(strain, .after = identifier)
+
+
+additive_means_norms <- outlier_filtered_frame |> 
+  select(!untreated_od & !relative_od) |> 
+  mutate(med = median(od_wo_background), .by = c(strain ,identifier, additive)) |>  
+  mutate(norm_od = od_wo_background - med)
+
+#hampel filter on treated plates
+#a bit strange of a solution, but seems to be working
+additives_filtered_outliers <- additive_means_norms |> 
+  filter(additive != "empty") |>
+  mutate(outlier = if_else(row_number() %in% Hampel(norm_od, 5), true = 1, false = 0), .by = c(strain, additive)) |> 
+  bind_rows(non_outlier_plates) #these are the controls
+
+
+#performing the testing =========
+#also old code but no way I'm revising this.... unless really needed...
+
+#prparing the data for the test
+t_test_data <- additives_filtered_outliers |> 
+  group_by(identifier) |> 
+  mutate(untreated_od =  #this section filters out the replicates with no control = all controls were outliers
+           if (any(additive == "empty")) {
+             mean(od_wo_background[additive == "empty"], na.rm = TRUE)
+           } else {NA_real_}) |> 
+  ungroup() |>  
+  select(!med & !norm_od) |> 
+  filter(additive != "empty",
+         outlier != 1) |> #only here do I remove the Hampel-marked treated values
+  mutate(mean_untreated_od = mean(untreated_od),
+         mean_treated_od = mean(od_wo_background),
+         median_untreated_od = median(untreated_od),
+         median_treated_od = median(od_wo_background),
+         .by = c("identifier", "additive")) |> 
+  distinct(identifier, strain, additive, mean_untreated_od, mean_treated_od, median_untreated_od, median_treated_od)
+
+#prep for the replicate reduction
+#extracting the date and also handling it as a date (might be useful later idk?)
+dated_data <- t_test_data |> 
+  filter(complete.cases(median_untreated_od, median_treated_od)) |> 
+  mutate(date_str = str_extract(string = identifier, pattern = "\\d{6}"),
+         date = as.Date(date_str, format = '%y%m%d'), .before = identifier)
+
+
+#creating the working dataframe
+date_sorted_data <- dated_data |> 
+  group_by(strain, additive) |> 
+  
+  #ordering newest first (remove 'desc()' to see with oldest-first)
+  #identifier is used to handle same-date experiment ties in ordering
+  arrange(desc(date), identifier) |>
+  
+  #counting replicates by group and ordering them based on position in the order
+  mutate(replicates = n(),
+         repli_order = row_number()) |> 
+  
+  #selecting only the pairs that have enough replicates to run all tests
+  #this is to make sure all tests use the same data
+  #replace 3 witha variable to set replicate upper limit, 3 is the standard currently
+  filter(replicates >= 3,
+         repli_order <= 3) |> 
+  ungroup()
+
+#paired t-test, can use both means and medians, but the difference is meager 
+#using MEDIANs as of now due to not-insignificant spread in the data
+t_test_results <- date_sorted_data |> 
+  filter(complete.cases(median_untreated_od, median_treated_od)) |> 
+  summarise(paired_p_value =
+              if (n() >= 2 && sd(median_untreated_od - median_treated_od) > 0)
+              {
+                t.test(median_untreated_od, median_treated_od, paired = T)$p.value
+              } else
+              {
+                NA_real_
+              }, .by = c("strain", "additive"))
+
+#fdr correction
+t_test_results_fdr <- t_test_results |> 
+  mutate(paired_FDR_p_value = p.adjust(paired_p_value, method = "fdr"), .by = strain)
+
+
+#exporting the data  ------------
+#preparing the data for exporting
+#replicate count
+replicate_count <- t_test_data |> 
+  summarise(replicate_nr = n(), .by = c("strain", "additive"))
+
+#tidying
+final_test_results <- t_test_results_fdr |> 
+  filter(additive != "empty") |>
+  arrange(strain, additive) |> 
+  mutate(p_value_fdr = paired_FDR_p_value) |> 
+  select(!paired_FDR_p_value) |> 
+  left_join(replicate_count, by = c("strain", "additive"))
+
+#counting significant result 
+#only counting strains which have at least 2 replicates
+test_result_significance <- final_test_results |> 
+  filter(replicate_nr >= 2) |> 
+  summarise(total = n(),
+            sign = sum(p_value_fdr < 0.1, na.rm = T), #default cutoff 0.05, use 0.1 instead from now
+            sign_percent = paste(round(sign/total*100, digits = 3), "%", sep = ''),
+            na_count = sum(is.na(p_value_fdr)))
+
+#export
+write_csv(x = final_test_results, file = file.path(save_folder, paste0("test_results_", measurement_date, ".csv")))
+write_csv(x = test_result_significance, file = file.path(save_folder, paste0("test_significance_", measurement_date, ".csv")))
+
+#exporting with relative OD
+OD_values <- outlier_filtered_frame |> 
+  select(identifier, strain, additive, relative_od) |> 
+  mutate(relative_od = if_else(relative_od < 0, true = 0, false = relative_od)) |> 
+  summarise(relative_od_mean  = mean(relative_od), .by = c("strain", "additive"))
+
+results_for_plotting <- t_test_results_fdr |> 
+  left_join(OD_values, by = c("strain", "additive"))
+
+write_csv(x = results_for_plotting, file = file.path(save_folder, paste0("realtive_od_results_", measurement_date, ".csv")))
+
